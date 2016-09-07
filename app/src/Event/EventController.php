@@ -10,10 +10,13 @@ use Symfony\Component\Form\FormFactoryInterface;
 use Symfony\Component\Validator\Validator;
 use Talk\TalkDb;
 use Talk\TalkApi;
+use Talk\TalkFormType;
+use Talk\TalkTypeApi;
 use User\UserDb;
 use User\UserApi;
 use Exception;
 use Slim\Slim;
+use Language\LanguageApi;
 
 class EventController extends BaseController
 {
@@ -49,8 +52,15 @@ class EventController extends BaseController
         $app->get('/event/view/:eventId(/:extra+)', array($this, 'redirectFromId'))
             ->name('event-redirect-from-id')
             ->conditions(array('eventId' => '\d+'));
-        $app->get('/event/:friendly_name/reported-comments', array($this, 'reportedComments'))->name("event-reported-comments");
-        $app->post('/event/:friendly_name/moderate-comment', array($this, 'moderateComment'))->name("event-moderate-comment");
+        $app->get('/event/:friendly_name/reported-comments', array($this, 'reportedComments'))
+            ->name("event-reported-comments");
+        $app->post('/event/:friendly_name/moderate-comment', array($this, 'moderateComment'))
+            ->name("event-moderate-comment");
+        $app->map('/event/:friendly_name/add-talk', array($this, 'addTalk'))->via('GET', 'POST')
+            ->name("event-add-talk");
+        $app->map('/event/:friendly_name/edit-tracks', array($this, 'editTracks'))->via('GET', 'POST')
+            ->name("event-edit-tracks");
+
     }
 
     public function index()
@@ -293,10 +303,12 @@ class EventController extends BaseController
             $scheduleView = 'grid';
         }
 
+        $this->application->flashKeep();
+
         $events_url = $this->application->urlFor("event-schedule-$scheduleView", ['friendly_name' => $friendly_name]);
         $this->application->redirect($events_url);
     }
-    
+
     public function scheduleList($friendly_name)
     {
         $eventApi = $this->getEventApi();
@@ -324,7 +336,7 @@ class EventController extends BaseController
         if (! $event) {
             $this->redirectToListPage();
         }
-        
+
         setcookie('schedule-view', 'grid', strtotime('+2 years'), '/');
 
         $talkApi = $this->getTalkApi();
@@ -477,7 +489,8 @@ class EventController extends BaseController
                 // held for moderation - note that we test for null explicitly as false means
                 // that we failed to submit the event to the API
                 if ($event === null) {
-                    $this->application->flash('message', "Thank you for your submission.\nIf your event is approved, you will receive an email letting you know it's been accepted.");
+                    $this->application->flash('message', "Thank you for your submission.\n"
+                        . "If your event is approved, you will receive an email letting you know it's been accepted.");
                     $this->redirectToListPage();
                 }
             }
@@ -548,7 +561,7 @@ class EventController extends BaseController
         if (!isset($_SESSION['user']) || $_SESSION['user']->getAdmin() == false) {
             $this->application->redirect($this->application->urlFor('not-allowed'));
         }
-        
+
         $eventApi = $this->getEventApi();
         $event    = $eventApi->getByFriendlyUrl($friendly_name);
         if (! $event) {
@@ -641,7 +654,7 @@ class EventController extends BaseController
             $result = $eventApi->submit($values);
         } catch (\Exception $e) {
             $form->addError(
-                new FormError('An error occurred while submitting your event: ' . $e->getMessage())
+                new FormError('an error occurred while submitting your event: ' . $e->getMessage())
             );
         }
 
@@ -702,6 +715,27 @@ class EventController extends BaseController
         $eventApi = new EventApi($this->cfg, $this->accessToken, $eventDb, $this->getUserApi());
 
         return $eventApi;
+    }
+
+    protected function getLanguageApi()
+    {
+        $languageApi = new LanguageApi($this->cfg, $this->accessToken);
+
+        return $languageApi;
+    }
+
+    protected function getTalkTypeApi()
+    {
+        $talkTypeApi = new TalkTypeApi($this->cfg, $this->accessToken);
+
+        return $talkTypeApi;
+    }
+
+    protected function getTrackApi()
+    {
+        $trackApi = new TrackApi($this->cfg, $this->accessToken);
+
+        return $trackApi;
     }
 
     /**
@@ -829,6 +863,164 @@ class EventController extends BaseController
 
         $url = $this->application->urlFor("event-reported-comments", ['friendly_name' => $friendly_name]);
         $this->application->redirect($url);
+    }
+
+    /**
+     * Add a talk to the event
+     *
+     * @param string $friendly_name
+     */
+    public function addTalk($friendly_name)
+    {
+        $eventApi = $this->getEventApi();
+        $event = $eventApi->getByFriendlyUrl($friendly_name);
+        if (!$event) {
+            return Slim::getInstance()->notFound();
+        }
+        if (!$event->getCanEdit()) {
+            $this->application->flash('error', "You do not have permission to do this.");
+            $this->redirectToDetailPage($event->getUrlFriendlyName());
+        }
+
+        $languageApi = $this->getLanguageApi();
+        $languages = $languageApi->getLanguagesChoiceList();
+
+        $talkTypeApi = $this->getTalkTypeApi();
+        $talkTypes = $talkTypeApi->getTalkTypesChoiceList();
+
+        $trackApi = $this->getTrackApi();
+        $tracks = $trackApi->getTracksChoiceList($event->getTracksUri());
+
+        // default values
+        $sessionKeys = ['duration', 'language', 'type', 'track'];
+        foreach ($sessionKeys as $key) {
+            $data[$key] = $this->getSessionVariable('add_talk_' . $key);
+        }
+        $data['speakers'][] = [];
+
+        /** @var FormFactoryInterface $factory */
+        $factory = $this->application->formFactory;
+        $form = $factory->create(new TalkFormType($event, $languages, $talkTypes, $tracks), $data);
+
+        $request = $this->application->request();
+        if ($request->isPost()) {
+            $form->submit($request->post($form->getName()));
+
+            if ($form->isValid()) {
+                $values = $form->getdata();
+
+                // store some values to session for next form
+                foreach ($sessionKeys as $key) {
+                    $_SESSION['add_talk_' . $key] = $values[$key];
+                }
+
+                try {
+                    $talkApi = $this->getTalkApi();
+                    $talk = $talkApi->addTalk($event->getTalksUri(), $values);
+
+                    if (!empty($values['track']) && isset($tracks[$values['track']])) {
+                        $talkApi->addTalkToTrack($talk->getTracksUri(), $values['track']);
+                    }
+
+                    $this->application->flash('message', "Talk added");
+                    $this->application->redirect(
+                        $this->application->urlFor('event-schedule', ['friendly_name' => $event->getUrlFriendlyName()])
+                    );
+                } catch (\Exception $e) {
+                    $form->adderror(
+                        new formError('An error occurred while adding this talk: ' . $e->getmessage())
+                    );
+                }
+            }
+        }
+
+        $this->render(
+            'Event/add-talk.html.twig',
+            array(
+                'event' => $event,
+                'form' => $form->createView(),
+            )
+        );
+    }
+
+    /**
+     * Edit tracks for this event
+     *
+     * @param string $friendly_name
+     */
+    public function editTracks($friendly_name)
+    {
+        $eventApi = $this->getEventApi();
+        $event = $eventApi->getByFriendlyUrl($friendly_name);
+        if (!$event) {
+            return Slim::getInstance()->notFound();
+        }
+        if (!$event->getCanEdit()) {
+            $this->application->flash('error', "You do not have permission to do this.");
+            $this->redirectToDetailPage($event->getUrlFriendlyName());
+        }
+
+        $trackApi = $this->getTrackApi();
+        $tracks = $trackApi->getTracks($event->getTracksUri());
+        $numberOfTracks = 0;
+        if ($tracks && $tracks['meta']['count']) {
+            $data['tracks'] = $tracks['tracks'];
+            $numberOfTracks = count($data['tracks']);
+        } else {
+            $data['tracks'][] = [];
+        }
+
+        $factory = $this->application->formFactory;
+        $form = $factory->create(new TrackCollectionFormType(), $data);
+
+        $request = $this->application->request();
+        if ($request->isPost()) {
+            $form->submit($request->post($form->getName()));
+
+            if ($form->isValid()) {
+                $values = $form->getdata();
+
+                try {
+                    $eventTracksUri = $event->getTracksUri();
+                    $updatedTrackUris = [];
+                    foreach ($values['tracks'] as $item) {
+                        if ($item['uri']) {
+                            $updatedTrackUris[$item['uri']] = $item['uri'];
+                            $trackApi->updateTrack($item['uri'], $item);
+                        } else {
+                            $trackApi->addTrack($eventTracksUri, $item);
+                        }
+                    }
+
+                    // have any tracks been removed from the form and so need to be deleted?
+                    if ($numberOfTracks > 0 && $numberOfTracks != count($updatedTrackUris)) {
+                        foreach ($data['tracks'] as $item) {
+                            if (!isset($updatedTrackUris[$item['uri']])) {
+                                $trackApi->deleteTrack($item['uri']);
+                            }
+                        }
+                    }
+
+                    $this->application->flash('message', "Tracks updated");
+                    $this->application->redirect(
+                        $this->application->urlFor('event-edit-tracks', array('friendly_name' => $event->getUrlFriendlyName()))
+                    );
+                } catch (\Exception $e) {
+                    $form->adderror(
+                        new formError('An error occurred while adding this talk: ' . $e->getmessage())
+                    );
+                }
+            }
+        }
+
+        $this->render(
+            'Event/edit-tracks.html.twig',
+            array(
+                'event' => $event,
+                'form' => $form->createView(),
+            )
+        );
+
     }
 
     /**
